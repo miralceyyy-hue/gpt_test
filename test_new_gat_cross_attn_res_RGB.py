@@ -31,7 +31,7 @@ K_INTRA = 6               # 同切片邻居数（任务2）
 K_CROSS = 50              # 跨切片MNN初始K（会做互为最近筛选）
 max_k = 6
 PCA_NCOMPS = 50           # 输入特征用的PCA维度
-HVG_PER_SLICE = 3000      # 每个切片内先选HVG数
+HVG_PER_SLICE = 5000      # 每个切片内先选HVG数
 SEED = 3407
 
 random.seed(SEED)
@@ -373,144 +373,108 @@ def load_and_prepare(paths):
         nbr_idx_s = idx_slice[idx_s[:, 1:K_INTRA+1]]            # 去自身，映射回全局索引
         nbr_idx[idx_slice] = nbr_idx_s
 
-    from sklearn.metrics.pairwise import cosine_similarity
     from sklearn.neighbors import NearestNeighbors
 
     # ---- 跨切片 MNN（任务3，基因表达值计算余弦相似度）----
-    # 这里只实现两两切片的 MNN，若>2，可两两配对后合并
     unique_slices = np.unique(slice_id)
     assert len(unique_slices) >= 2, "需要至少两个切片做MNN"
 
-    # 在每个切片上分别获取基因表达数据
-    X_raw = np.asarray(ad_all.X.todense(), dtype=np.float32)  # (gene x cell)
+    X_raw = np.asarray(ad_all.X.todense(), dtype=np.float32)
+
+    idx_by_slice: Dict[int, np.ndarray] = {
+        sid: np.where(slice_id == sid)[0] for sid in unique_slices
+    }
+
+    cross_lists: List[set] = [set() for _ in range(N)]
+    mnn_pairs: List[Tuple[int, int]] = []
+
+    print('计算MNN配对（支持多切片）')
+    for i, sid_a in enumerate(unique_slices):
+        idx_a = idx_by_slice[sid_a]
+        if idx_a.size == 0:
+            continue
+        X_a = X_raw[idx_a]
+        for sid_b in unique_slices[i + 1:]:
+            idx_b = idx_by_slice[sid_b]
+            if idx_b.size == 0:
+                continue
+
+            X_b = X_raw[idx_b]
+
+            n_ab = min(K_CROSS, idx_b.size)
+            n_ba = min(K_CROSS, idx_a.size)
+            if n_ab == 0 or n_ba == 0:
+                continue
+
+            knn_ab = NearestNeighbors(n_neighbors=n_ab, metric='cosine').fit(X_b)
+            _, j_ab = knn_ab.kneighbors(X_a)
+
+            knn_ba = NearestNeighbors(n_neighbors=n_ba, metric='cosine').fit(X_a)
+            _, j_ba = knn_ba.kneighbors(X_b)
+
+            j_ba_sets = [set(neigh.tolist()) for neigh in j_ba]
+
+            for a_local, neighs_in_b in enumerate(j_ab):
+                a_global = idx_a[a_local]
+                for b_local in neighs_in_b:
+                    if a_local in j_ba_sets[b_local]:
+                        b_global = idx_b[b_local]
+                        cross_lists[a_global].add(b_global)
+                        cross_lists[b_global].add(a_global)
+                        mnn_pairs.append((a_global, b_global))
 
 
-    # 先获取切片 ID
-    slice_id = ad_all.obs['slice_id'].to_numpy().astype(np.int64)  # (N,)
-
-    # 获取切片的唯一标识
-    unique_slices = np.unique(slice_id)
-
-    # 仅实现两个切片的情况（可以扩展到更多切片）
-    sid0, sid1 = unique_slices[:2]
-    idx0 = np.where(slice_id == sid0)[0]  # 获取切片0的所有细胞索引
-    idx1 = np.where(slice_id == sid1)[0]  # 获取切片1的所有细胞索引
-
-    # 提取两个切片的基因表达数据
-    X0 = X_raw[idx0, :]  # 切片0的基因表达数据
-    X1 = X_raw[idx1, :]  # 切片1的基因表达数据
-
-    # knn: 计算从X0到X1和从X1到X0的最近邻
-    print('计算MNN配对')
-    knn01 = NearestNeighbors(n_neighbors=K_CROSS, metric='cosine').fit(X1)  # 以X1为基准，找X0的邻居
-    d01, j01 = knn01.kneighbors(X0)  # d01: 距离，j01: 切片0的每个细胞在切片1上的最近邻索引
-
-    knn10 = NearestNeighbors(n_neighbors=K_CROSS, metric='cosine').fit(X0)  # 以X0为基准，找X1的邻居
-    d10, j10 = knn10.kneighbors(X1)  # d10: 距离，j10: 切片1的每个细胞在切片0上的最近邻索引
 
 
-    # MNN：i∈slice0 与 j∈slice1 互为近邻
-    # 为每个全局 i 收集跨切片邻居列表
-    cross_lists: List[List[int]] = [[] for _ in range(N)]
-    print('从 0 -> 1 方向遍历')
-    # 从 0 -> 1 方向遍历，检查互为最近
-    for a_local, neighs_in_1 in enumerate(j01):
-        a_global = idx0[a_local]
-        for k in range(neighs_in_1.shape[0]):
-            b_local = neighs_in_1[k]
-            b_global = idx1[b_local]
-            # 检查 a 是否出现在 b 的近邻中
-            if a_local in j10[b_local]:
-                cross_lists[a_global].append(b_global)
-    print('从 1 -> 0 方向遍历')
-    # 从 1 -> 0 方向补充（双向收集）
-    for b_local, neighs_in_0 in enumerate(j10):
-        b_global = idx1[b_local]
-        for k in range(neighs_in_0.shape[0]):
-            a_local = neighs_in_0[k]
-            a_global = idx0[a_local]
-            if b_local in j01[a_local]:
-                cross_lists[b_global].append(a_global)
 
 
-    # 你如果想固定上限，也可改成：max_k = K_CROSS
+
+
     cross_idx = np.full((N, max_k), -1, dtype=np.int64)
     cross_mask = np.zeros((N, max_k), dtype=bool)
-    for i, lst in enumerate(cross_lists):
-        if not lst:
+    for i, neighbors in enumerate(cross_lists):
+        if not neighbors:
             continue
-        # 去重并截断
-        uniq = np.unique(lst)[:max_k]
-        cross_idx[i, :len(uniq)] = uniq
-        cross_mask[i, :len(uniq)] = True
+        neigh_arr = np.array(sorted(neighbors), dtype=np.int64)
+        neigh_arr = neigh_arr[:max_k]
+        cross_idx[i, :len(neigh_arr)] = neigh_arr
+        cross_mask[i, :len(neigh_arr)] = True
 
-    # ========= 统计：MNN 对数 / 覆盖的细胞数 / Region 一致性 =========
-    # 1) 用“单向遍历 + 互为近邻检查”的方式构造唯一配对（避免双向重复）
-    mnn_pairs = []  # 列表元素: (a_global_in_slice0, b_global_in_slice1)
-    for a_local, neighs_in_1 in enumerate(j01):
-        n = 0
-        for b_local in neighs_in_1:
-            # 互为近邻判定
-            if a_local in j10[b_local]:
-                a_global = idx0[a_local]
-                b_global = idx1[b_local]
-                mnn_pairs.append((a_global, b_global))
-                n += 1
-                if(n == max_k):
-                    break
+    if mnn_pairs:
+        unique_cells_by_slice: Dict[int, set] = {sid: set() for sid in unique_slices}
+        for a_global, b_global in mnn_pairs:
+            unique_cells_by_slice[int(slice_id[a_global])].add(int(a_global))
+            unique_cells_by_slice[int(slice_id[b_global])].add(int(b_global))
 
-    # 2) 去重（极少数情况下可能重复，稳妥起见做一次 set）
-    mnn_pairs = list(set(mnn_pairs))
+        num_pairs = len(mnn_pairs)
+        print(f"[MNN统计] 总配对数: {num_pairs}")
+        for sid in unique_slices:
+            covered = len(unique_cells_by_slice[sid])
+            print(f"[MNN统计] 切片 {sid} 覆盖细胞数: {covered}")
 
-    # 3) 覆盖的细胞数
-    cells0 = sorted({a for (a, b) in mnn_pairs})
-    cells1 = sorted({b for (a, b) in mnn_pairs})
-    num_pairs = len(mnn_pairs)
-    num_cells0 = len(cells0)
-    num_cells1 = len(cells1)
+        if 'Region' in ad_all.obs.columns:
+            from collections import Counter
 
-    # 4) Region 一致性统计
-    if 'Region' in ad_all.obs.columns:
-        region = ad_all.obs['Region'].to_numpy()
-        from collections import Counter
-        pair_bucket = Counter()
-        num_match = 0
-        num_mismatch = 0
-        for a, b in mnn_pairs:
-            ra = region[a]
-            rb = region[b]
-            pair_bucket[(ra, rb)] += 1
-            if ra == rb:
-                num_match += 1
-            else:
-                num_mismatch += 1
-        # 可读性更好的总结
-        mnn_stats = {
-            "num_pairs": int(num_pairs),
-            "slice0_unique_cells": int(num_cells0),
-            "slice1_unique_cells": int(num_cells1),
-            "region_match": int(num_match),
-            "region_mismatch": int(num_mismatch),
-            "region_pair_counts": {f"{k[0]}__vs__{k[1]}": int(v) for k, v in pair_bucket.items()},
-        }
-    else:
-        mnn_stats = {
-            "num_pairs": int(num_pairs),
-            "slice0_unique_cells": int(num_cells0),
-            "slice1_unique_cells": int(num_cells1),
-            "region_match": None,
-            "region_mismatch": None,
-            "region_pair_counts": None,
-            "note": "obs['Region'] 不存在，无法做 Region 一致性统计",
-        }
+            region = ad_all.obs['Region'].to_numpy()
+            pair_bucket = Counter()
+            num_match = 0
+            num_mismatch = 0
+            for a_global, b_global in mnn_pairs:
+                ra = region[a_global]
+                rb = region[b_global]
+                pair_bucket[(ra, rb)] += 1
+                if ra == rb:
+                    num_match += 1
+                else:
+                    num_mismatch += 1
 
-    # （可选）打印一份摘要
-    print("[MNN统计] #pairs:", mnn_stats["num_pairs"],
-          "| slice0覆盖:", mnn_stats["slice0_unique_cells"],
-          "| slice1覆盖:", mnn_stats["slice1_unique_cells"])
-    if mnn_stats.get("region_match") is not None:
-        print("[MNN统计] Region一致:", mnn_stats["region_match"],
-              "| 不一致:", mnn_stats["region_mismatch"])
+            print("[MNN统计] Region一致:", num_match, "| 不一致:", num_mismatch)
+            print("[MNN统计] Region组合:")
+            for (ra, rb), cnt in pair_bucket.items():
+                print(f"  - {ra} vs {rb}: {cnt}")
+        else:
+            print('[MNN统计] 未找到任何互为最近邻配对')
+
 
 
 
@@ -545,8 +509,7 @@ def load_and_prepare(paths):
     valid_mask_array = np.array([np.pad(mask, (0, max_n - len(mask)), constant_values=False) for mask in valid_mask])
 
     degrees = np.sum(valid_mask, axis=1)  # 计算每个节点的有效邻居数量
-    print(valid_mask_array)
-    print(degrees)
+
 
     # ========= 打包为张量（变量名与后续模型对齐）=========
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -718,7 +681,7 @@ class IntraEnvAggregator(nn.Module):
     """
     输入/输出都在 h 空间；返回 h_env (N, h_dim)
     """
-    def __init__(self, emb_dim: int = 32, out_dim: int = 10, num_heads: int = 4,dropout: float = 0.1):
+    def __init__(self, emb_dim: int = 32, out_dim: int = 10, num_heads: int = 2,dropout: float = 0.1):
         super().__init__()
         self.num_heads = num_heads
         self.d_model = emb_dim
@@ -1252,6 +1215,9 @@ if __name__ == "__main__":
     print("  G:", rgb_min[1], "~", rgb_max[1])
     print("  B:", rgb_min[2], "~", rgb_max[2])
 
+    print(out["X_t"].shape[1])
+
+
     # === 1) 模型组件 ===
     H_DIM = 512
     out_dim = 32
@@ -1385,7 +1351,7 @@ if __name__ == "__main__":
         # ---- 总损失 & 反传 ----
         loss = (
             lambda_zkl   * loss_zkl
-          + contrastive_loss_fuse_self/10
+          + contrastive_loss_fuse_self
           + loss_reconstruction
           # + coord_reconstruction_loss
           # + contrastive_loss_h_fuse
@@ -1411,7 +1377,7 @@ if __name__ == "__main__":
               f"| total={loss.item():.4f}")
 
         # 调用处（计算好 z 后）
-        out_dir = f"./new_gat_cross_attn_res/epoch_{epoch}"
+        out_dir = f"./new_gat_cross_attn_res_slice73-76_loss_0/epoch_{epoch}"
         save_epoch_z_and_rgb_global_to_img_range(
             res_z_tensor=r_base["z"],
             out_dict=out,
