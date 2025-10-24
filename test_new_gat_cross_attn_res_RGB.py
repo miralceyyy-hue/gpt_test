@@ -736,7 +736,8 @@ class IntraEnvAggregator(nn.Module):
 
         # 计算注意力
         attn1 = torch.sigmoid(scores1)
-        attn1 = torch.softmax(scores1, dim=-1)  # (N, num_heads, K)
+
+        attn1 = torch.softmax(attn1, dim=-1)  # (N, num_heads, K)
         attn1 = self.drop(attn1)
         context1 = (attn1.unsqueeze(-1) * v1).sum(dim=-2)  # (N, num_heads, head_dim)
         # 将多个头拼接起来
@@ -1288,45 +1289,16 @@ if __name__ == "__main__":
             r_base["mu_z"], r_base["logvar_z"], out["mu_rgb_t"], out["var_rgb_t"]
         )
 
+        # ---- 耦合线（只训练 R；W* 为批内岭回归标尺，stopgrad）----
+        dz = r_base["z"]   # (N,3)
+        dh = h_fuse_stopped      # (N,H_DIM)
 
 
+        W_star = _ridge_fit(dh, dz, l2=1e-3)         # (H_DIM,3)
 
-        # # ---- 渲染 & z-KL（只训练 R；h 不回传）----
-        # with torch.no_grad():
-        #     h_det  = h.detach()
-        #     h2_det = h_intra.detach()
-        #     h3_det = h_cross.detach()
-        #
-        # r_base  = R(h_det)   # {'mu_z','logvar_z','z'}
-        # r_intra = R(h2_det)
-        # r_cross = R(h3_det)
-        #
-        # loss_zkl = kl_rgb_loss(
-        #     r_base["mu_z"], r_base["logvar_z"], out["mu_rgb_t"], out["var_rgb_t"]
-        # )
-        #
-        # # ---- 耦合线（只训练 R；W* 为批内岭回归标尺，stopgrad）----
-        # dz_intra = r_intra["z"] - r_base["z"]   # (N,3)
-        # dz_cross = r_cross["z"] - r_base["z"]   # (N,3)
-        # dh_intra = (h_intra - h).detach()       # (N,H_DIM)
-        # dh_cross = (h_cross - h).detach()
-        #
-        # with torch.no_grad():
-        #     Hd = torch.cat([dh_intra, dh_cross], dim=0)  # (2N,H_DIM)
-        #     Zd = torch.cat([dz_intra, dz_cross], dim=0)  # (2N,3)
-        #     W_star = _ridge_fit(Hd, Zd, l2=1e-3)         # (H_DIM,3)
-        #
-        # loss_cpl_dir   = coupling_dir_loss(dz_intra, dh_intra, W_star) \
-        #                + coupling_dir_loss(dz_cross, dh_cross, W_star)
-        # loss_cpl_ratio = 0.1 * (coupling_ratio_loss(dz_intra, dh_intra, W_star) \
-        #                       + coupling_ratio_loss(dz_cross, dh_cross, W_star))
-        # if epoch % update_interval == 0 and epoch < max_up_epoch:
-        #     print(f"Updating neighbor mask at epoch {epoch}")
-        #     updated_nbr_mask = update_neighbor_mask_with_clustering(h_fuse, out["nbr_idx_t"], nbr_mask, update_interval=update_interval,
-        #                                             epoch=epoch)
-        #     # 使用更新后的邻居 mask 进行后续计算
-        #     nbr_mask = updated_nbr_mask
-        #     print(nbr_mask[:10])  # 打印 nbr_mask 的前 10 行
+        loss_cpl_dir   = coupling_dir_loss(dz, dh, W_star)
+        loss_cpl_ratio = coupling_ratio_loss(dz, dh, W_star)
+
 
         # === (G) 对比学习损失 ===
         contrastive_loss_fuse_self = info_nce_loss_fuse_self(
@@ -1351,8 +1323,10 @@ if __name__ == "__main__":
         # ---- 总损失 & 反传 ----
         loss = (
             lambda_zkl   * loss_zkl
-          + contrastive_loss_fuse_self
+          + contrastive_loss_fuse_self/10
           + loss_reconstruction
+          + loss_cpl_dir
+          + loss_cpl_ratio
           # + coord_reconstruction_loss
           # + contrastive_loss_h_fuse
 
@@ -1373,11 +1347,13 @@ if __name__ == "__main__":
               # f"| contrastive={contrastive_loss_fuse_self.item():.4f} | contrastive={contrastive_loss_h_fuse.item():.4f}}}"
               f"| contrastive={contrastive_loss_fuse_self.item():.4f}"
               f"| reconstruction={loss_reconstruction.item():.4f}"
+              f"| cpl_dir={loss_cpl_dir.item():.4f}"
+              f"| cpl_ratio={loss_cpl_ratio.item():.4f}"
               # f"| coords_reconstruction={coord_reconstruction_loss.item():.4f}"
               f"| total={loss.item():.4f}")
 
         # 调用处（计算好 z 后）
-        out_dir = f"./new_gat_cross_attn_res_slice73-76_loss_0/epoch_{epoch}"
+        out_dir = f"./new_gat_cross_attn_res_slice73-76_loss_cpl/epoch_{epoch}"
         save_epoch_z_and_rgb_global_to_img_range(
             res_z_tensor=r_base["z"],
             out_dict=out,
