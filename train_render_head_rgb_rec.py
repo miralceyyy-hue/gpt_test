@@ -179,8 +179,8 @@ def train_render_head(
         # loss_cpl_ratio = coupling_ratio_loss(dz, dh, W_star)
 
         # ====== 新增：基因表达重构损失 ======
-        # recon_pred = reconstructor(dz)
-        # loss_recon = F.mse_loss(recon_pred, X_target)
+        recon_pred = reconstructor(dz)
+        loss_recon = F.mse_loss(recon_pred, X_target)
 
         # ====== 新增：z 通道正交约束 ======
         # loss_ortho = orthogonality_loss(dz)
@@ -189,7 +189,7 @@ def train_render_head(
             lambda_zkl * loss_zkl
             # + lambda_cpl_dir * loss_cpl_dir
             # + lambda_cpl_ratio * loss_cpl_ratio
-            # + lambda_recon * loss_recon
+            + lambda_recon * loss_recon
             # + lambda_ortho * loss_ortho
         )
 
@@ -202,7 +202,7 @@ def train_render_head(
             f"zKL={loss_zkl.item():.4f} "
             # f"| cpl_dir={loss_cpl_dir.item():.4f} "
             # f"| cpl_ratio={loss_cpl_ratio.item():.4f} "
-            # f"| 重构={loss_recon.item():.4f} "
+            f"| 重构={loss_recon.item():.4f} "
             # f"| 正交={loss_ortho.item():.4f} "
             f"| 总损失={loss.item():.4f}"
         )
@@ -214,7 +214,7 @@ def train_render_head(
                 loss_zkl.item(),
                 # loss_cpl_dir.item(),
                 # loss_cpl_ratio.item(),
-                # loss_recon.item(),
+                loss_recon.item(),
                 # loss_ortho.item(),
             ]
         )
@@ -241,7 +241,7 @@ def train_render_head(
                 "zKL",
                 # "方向耦合损失",
                 # "比例耦合损失",
-                # "重构损失",
+                "重构损失",
                 # "正交损失",
             ]
         )
